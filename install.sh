@@ -66,7 +66,7 @@ tmp="$(mktemp "${TMPDIR:-/tmp}/gsw.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
 # Prefer a local checkout when run from inside the repository.
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || script_dir=""
 if [[ "$REF" == "main" && -f "$script_dir/bin/gsw" ]]; then
     cp "$script_dir/bin/gsw" "$tmp"
 else
