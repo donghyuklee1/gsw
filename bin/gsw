@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+#
+# gsw - Git Smart Switch
+# Switch Git branches in under a second with an fzf-powered, recency-sorted picker.
+#
+# Copyright (c) 2026 Donghyuk Lee
+# Licensed under the MIT License. See LICENSE for details.
+
+set -o pipefail
+
+readonly VERSION="1.0.0"
+readonly PROG="gsw"
+
+# Preview depth (number of commits shown in the right pane).
+GSW_PREVIEW_COUNT="${GSW_PREVIEW_COUNT:-10}"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[31m' C_YELLOW=$'\033[33m'
+    C_BOLD=$'\033[1m' C_DIM=$'\033[2m' C_RESET=$'\033[0m'
+else
+    C_RED="" C_YELLOW="" C_BOLD="" C_DIM="" C_RESET=""
+fi
+
+err()  { printf '%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; }
+info() { printf '%s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+$PROG $VERSION - Git Smart Switch
+
+Interactively switch Git branches, sorted by most recent commit.
+
+Usage:
+  $PROG [options] [query]
+
+Arguments:
+  query            Pre-fill the search. If exactly one branch matches,
+                   switch to it immediately without opening the picker.
+  -                Switch to the previously checked-out branch.
+
+Options:
+  -r, --remote     Start with local + remote branches shown
+  -l, --list       Print the branch list (no UI) and exit
+  -h, --help       Show this help and exit
+  -v, --version    Show version and exit
+
+Keys (inside the picker):
+  enter            Switch to the highlighted branch
+  ctrl-r           Toggle local only <-> local + remote branches
+  ctrl-d           Delete the highlighted local branch (with confirmation)
+  esc / ctrl-c     Quit without changing anything
+
+Environment:
+  GSW_PREVIEW_COUNT   Commits shown in the preview pane (default: 10)
+  GSW_HEIGHT          Picker height (default: 80%)
+  GSW_FZF_OPTS        Extra options passed to fzf
+  NO_COLOR            Disable colored output
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+require_git_repo() {
+    if ! command -v git >/dev/null 2>&1; then
+        err "git is not installed"
+        exit 1
+    fi
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        err "Not a git repository (or any of the parent directories)"
+        exit 128
+    fi
+}
+
+require_fzf() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        err "fzf is required but not installed"
+        info "  macOS:          brew install fzf"
+        info "  Debian/Ubuntu:  sudo apt install fzf"
+        info "  Arch:           sudo pacman -S fzf"
+        info "  Other:          https://github.com/junegunn/fzf#installation"
+        exit 1
+    fi
+}
+
+# Name of the checked-out branch; empty when HEAD is detached.
+current_branch() {
+    git symbolic-ref --quiet --short HEAD 2>/dev/null
+}
+
+# Emit one line per branch, most recent first:
+#   <full refname> TAB <age> TAB <branch> TAB <subject>
+# Field 1 is hidden in the UI and used for preview/switch/delete; the rest
+# are padded with spaces so columns line up (fzf runs with --tabstop=1).
+# $1: "local" or "all"
+list_branches() {
+    local mode="$1" refs=(refs/heads)
+    [[ "$mode" == "all" ]] && refs+=(refs/remotes)
+
+    local color_time="" color_local="" color_remote="" color_reset=""
+    if [[ -z "${NO_COLOR:-}" ]]; then
+        color_time=$'\033[33m' color_local=$'\033[1;32m'
+        color_remote=$'\033[1;35m' color_reset=$'\033[0m'
+    fi
+
+    git for-each-ref --sort=-committerdate "${refs[@]}" \
+        --format='%(refname)%09%(committerdate:unix)%09%(refname:short)%09%(symref)%09%(subject)' 2>/dev/null |
+    awk -F '\t' \
+        -v now="$(date +%s)" \
+        -v current="refs/heads/$(current_branch)" \
+        -v upstream="$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null)" \
+        -v ct="$color_time" -v cl="$color_local" -v cr="$color_remote" -v c0="$color_reset" '
+    function age(ts,   d) {
+        d = now - ts
+        if (d < 0) d = 0
+        if (d < 60)       return d "s ago"
+        if (d < 3600)     return int(d / 60) "m ago"
+        if (d < 86400)    return int(d / 3600) "h ago"
+        if (d < 604800)   return int(d / 86400) "d ago"
+        if (d < 2629800)  return int(d / 604800) "w ago"
+        if (d < 31557600) return int(d / 2629800) "mo ago"
+        return int(d / 31557600) "y ago"
+    }
+    {
+        ref = $1
+        if (ref == current) next          # never offer the branch we are on
+        if (ref == upstream) next         # ...or its remote-tracking twin
+        if ($4 != "") next                # skip symbolic refs like origin/HEAD
+        n++
+        refs[n] = ref; ages[n] = age($2); names[n] = $3
+        subj = $5
+        for (i = 6; i <= NF; i++) subj = subj "\t" $i
+        subjects[n] = subj
+        if (length(ages[n]) > aw) aw = length(ages[n])
+        if (length($3) > nw) nw = length($3)
+    }
+    END {
+        if (nw > 48) nw = 48
+        for (i = 1; i <= n; i++) {
+            color = (refs[i] ~ /^refs\/remotes\//) ? cr : cl
+            printf "%s\t%s%*s%s  \t%s%-*s%s  \t%s\n", refs[i], \
+                ct, aw, ages[i], c0, color, nw, names[i], c0, subjects[i]
+        }
+    }'
+}
+
+# Short, human-facing name for a full refname.
+short_ref() {
+    local ref="$1"
+    ref="${ref#refs/heads/}"
+    ref="${ref#refs/remotes/}"
+    printf '%s' "$ref"
+}
+
+git_supports_switch() {
+    git switch -h >/dev/null 2>&1
+    # `git switch -h` exits 129 when supported; unknown commands exit 1.
+    [[ $? -eq 129 ]]
+}
+
+# Switch to the given full refname.
+switch_to() {
+    local ref="$1"
+    case "$ref" in
+        refs/heads/*)
+            local branch="${ref#refs/heads/}"
+            if git_supports_switch; then
+                git switch "$branch"
+            else
+                git checkout "$branch"
+            fi
+            ;;
+        refs/remotes/*)
+            local remote_branch="${ref#refs/remotes/}"
+            local local_name="${remote_branch#*/}"
+            if git show-ref --verify --quiet "refs/heads/$local_name"; then
+                # A local branch already exists; switch to it instead of
+                # creating a second one.
+                info "${C_DIM}Local branch '$local_name' exists; switching to it.${C_RESET}"
+                switch_to "refs/heads/$local_name"
+                return
+            fi
+            if git_supports_switch; then
+                git switch --track "$remote_branch"
+            else
+                git checkout --track "$remote_branch"
+            fi
+            ;;
+        *)
+            err "unknown ref: $ref"
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands invoked by fzf key bindings (internal, not part of the CLI)
+# ---------------------------------------------------------------------------
+
+# Print the mode banner (consumed by fzf --header-lines=1) and the list.
+# $1: state file holding the current mode; $2: "keep" or "toggle"
+cmd_feed() {
+    local state="$1" action="$2" mode
+    mode="$(cat "$state" 2>/dev/null || echo local)"
+    if [[ "$action" == "toggle" ]]; then
+        [[ "$mode" == "local" ]] && mode="all" || mode="local"
+        printf '%s' "$mode" >"$state"
+    fi
+    if [[ "$mode" == "all" ]]; then
+        printf '\t\033[1;35m● local + remote\033[0m  \033[2m(ctrl-r: local only)\033[0m\n'
+    else
+        printf '\t\033[1;32m● local\033[0m  \033[2m(ctrl-r: include remotes)\033[0m\n'
+    fi
+    list_branches "$mode"
+}
+
+cmd_preview() {
+    local ref="$1" head
+    [[ -z "$ref" ]] && return 0
+    head="$(current_branch)"
+    head="${head:-HEAD}"
+
+    local counts ahead behind
+    if counts="$(git rev-list --left-right --count "HEAD...$ref" 2>/dev/null)"; then
+        behind="${counts%%[[:space:]]*}"
+        ahead="${counts##*[[:space:]]}"
+        printf '\033[1m%s\033[0m  \033[32m↑%s\033[0m \033[31m↓%s\033[0m \033[2mvs %s\033[0m\n' \
+            "$(short_ref "$ref")" "$ahead" "$behind" "$head"
+    fi
+    git log -1 --format='%C(dim)%an · %cr%C(reset)' "$ref" 2>/dev/null
+    echo
+    git log --graph --oneline --decorate --color=always -n "$GSW_PREVIEW_COUNT" "$ref" 2>/dev/null
+}
+
+# Delete a branch from inside the picker; reads answers from the terminal.
+cmd_delete() {
+    local ref="$1" branch answer
+    if [[ "$ref" == refs/remotes/* ]]; then
+        local rb="${ref#refs/remotes/}"
+        printf '\n%s is a remote branch; gsw only deletes local branches.\n' "$rb"
+        printf 'To delete it on the remote:  git push %s --delete %s\n' "${rb%%/*}" "${rb#*/}"
+        printf '\n\033[2mPress any key to return...\033[0m'
+        read -r -n 1 -s _ </dev/tty 2>/dev/null
+        return 0
+    fi
+
+    branch="${ref#refs/heads/}"
+    printf '\n\033[1;31mDelete branch\033[0m \033[1m%s\033[0m? [y/N] ' "$branch"
+    read -r -n 1 answer </dev/tty 2>/dev/null
+    echo
+    [[ "$answer" == [yY] ]] || { echo "Cancelled."; sleep 0.4; return 0; }
+
+    if git branch -d "$branch"; then
+        sleep 0.5
+        return 0
+    fi
+
+    printf '\n\033[33mBranch is not fully merged.\033[0m Force delete with -D? (commits may be lost) [y/N] '
+    read -r -n 1 answer </dev/tty 2>/dev/null
+    echo
+    if [[ "$answer" == [yY] ]]; then
+        git branch -D "$branch"
+        sleep 0.5
+    else
+        echo "Kept $branch."
+        sleep 0.4
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+self_path() {
+    local dir
+    dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    printf '%s/%s' "$dir" "$(basename "${BASH_SOURCE[0]}")"
+}
+
+# Non-interactive fuzzy match using the same fields as the picker.
+filter_branches() {
+    [[ -z "$1" ]] && return 0
+    printf '%s\n' "$1" |
+        fzf --ansi --tabstop=1 --delimiter='\t' --with-nth=2.. --nth=2,3 --filter="$2"
+}
+
+run_picker() {
+    local mode="$1" query="$2"
+    local self state q_self q_state
+    self="$(self_path)"
+    state="$(mktemp "${TMPDIR:-/tmp}/gsw.XXXXXX")" || { err "cannot create temp file"; exit 1; }
+    # shellcheck disable=SC2064
+    trap "rm -f '$state'" EXIT
+    printf '%s' "$mode" >"$state"
+
+    q_self="$(printf '%q' "$self")"
+    q_state="$(printf '%q' "$state")"
+    local feed="$q_self --_feed $q_state"
+
+    local selection fzf_status
+    # fzf runs bindings through $SHELL; force bash so quoting is predictable
+    # regardless of the user's login shell (fish, nu, ...).
+    # shellcheck disable=SC2086
+    selection="$(
+        "$self" --_feed "$state" keep |
+        SHELL="$BASH" fzf \
+            --ansi \
+            --no-sort \
+            --layout=reverse \
+            --height="${GSW_HEIGHT:-80%}" \
+            --border \
+            --tabstop=1 \
+            --delimiter='\t' \
+            --with-nth=2.. \
+            --nth=2,3 \
+            --header-lines=1 \
+            --header='enter switch · ctrl-r remotes · ctrl-d delete · esc quit' \
+            --prompt='branch ❯ ' \
+            --pointer='▶' \
+            --query="$query" \
+            --preview="$q_self --_preview {1}" \
+            --preview-window='right,50%,wrap,border-left' \
+            --bind="ctrl-r:reload($feed toggle)" \
+            --bind="ctrl-d:execute($q_self --_delete {1})+reload($feed keep)" \
+            --bind='ctrl-c:abort,esc:abort' \
+            ${GSW_FZF_OPTS:-}
+    )"
+    fzf_status=$?
+
+    # 130 = esc/ctrl-c, 1 = no match: leave everything untouched.
+    if [[ $fzf_status -ne 0 || -z "$selection" ]]; then
+        exit 0
+    fi
+    switch_to "${selection%%$'\t'*}"
+}
+
+main() {
+    local mode="local" query=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)    usage; exit 0 ;;
+            -v|--version) echo "$PROG $VERSION"; exit 0 ;;
+            -r|--remote)  mode="all" ;;
+            -l|--list)
+                require_git_repo
+                [[ -t 1 ]] || NO_COLOR=1
+                list_branches "$mode" | cut -f2-
+                exit 0
+                ;;
+            --_feed)      cmd_feed "$2" "${3:-keep}"; exit $? ;;
+            --_preview)   cmd_preview "$2"; exit 0 ;;
+            --_delete)    cmd_delete "$2"; exit 0 ;;
+            -)
+                require_git_repo
+                if git_supports_switch; then git switch -; else git checkout -; fi
+                exit $?
+                ;;
+            --) shift; query="$*"; break ;;
+            -*) err "unknown option: $1"; info "Run '$PROG --help' for usage."; exit 2 ;;
+            *)  query="${query:+$query }$1" ;;
+        esac
+        shift
+    done
+
+    require_git_repo
+
+    local candidates
+    candidates="$(list_branches "$mode")"
+    if [[ -z "$candidates" && "$mode" == "local" ]]; then
+        # No other local branches; fall back to remotes if there are any.
+        candidates="$(list_branches all)"
+        [[ -n "$candidates" ]] && mode="all"
+    fi
+    if [[ -z "$candidates" ]]; then
+        local cur
+        cur="$(current_branch)"
+        info "Already on the only available branch: ${C_BOLD}${cur:-HEAD (detached)}${C_RESET}"
+        exit 0
+    fi
+
+    require_fzf
+
+    # Query given: jump straight to a unique match without opening the UI.
+    if [[ -n "$query" ]]; then
+        local matches count
+        matches="$(filter_branches "$candidates" "$query")"
+        if [[ -z "$matches" && "$mode" == "local" ]]; then
+            # Nothing local matched; the branch may exist only on a remote.
+            candidates="$(list_branches all)"
+            mode="all"
+            matches="$(filter_branches "$candidates" "$query")"
+        fi
+        count="$(printf '%s' "$matches" | grep -c '' || true)"
+        if [[ "$count" -eq 0 ]]; then
+            err "no branch matches '$query'"
+            exit 1
+        elif [[ "$count" -eq 1 ]]; then
+            switch_to "${matches%%$'\t'*}"
+            exit $?
+        fi
+    fi
+
+    if ! { : </dev/tty; } 2>/dev/null; then
+        err "interactive picker requires a terminal"
+        exit 1
+    fi
+
+    run_picker "$mode" "$query"
+}
+
+main "$@"

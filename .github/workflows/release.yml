@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches script version
+        run: |
+          version="$(grep 'readonly VERSION=' bin/gsw | cut -d'"' -f2)"
+          [ "v$version" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::Tag $GITHUB_REF_NAME does not match bin/gsw VERSION $version"; exit 1; }
+
+      - name: Build checksums
+        run: |
+          cp bin/gsw gsw
+          sha256sum gsw > gsw.sha256
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(awk -v v="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" v "\\]" {f=1; next}
+            f && /^## \[/ {exit}
+            f {print}' CHANGELOG.md)"
+          gh release create "$GITHUB_REF_NAME" gsw gsw.sha256 \
+            --title "gsw $GITHUB_REF_NAME" --notes "${notes:-Release $GITHUB_REF_NAME}"

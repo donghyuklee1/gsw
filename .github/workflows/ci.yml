@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: shellcheck bin/gsw install.sh uninstall.sh tests/test_gsw.sh
+
+      - name: Check executable bits
+        run: |
+          for f in bin/gsw install.sh uninstall.sh tests/test_gsw.sh; do
+            test -x "$f" || { echo "::error::$f is not executable"; exit 1; }
+          done
+
+  test:
+    name: Tests (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fzf (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fzf
+
+      - name: Install fzf (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fzf
+
+      - name: Test suite
+        run: ./tests/test_gsw.sh
+
+      - name: Test suite under Bash 3.2 (macOS system bash)
+        if: runner.os == 'macOS'
+        run: /bin/bash ./tests/test_gsw.sh
+
+      - name: Install script
+        run: |
+          ./install.sh --prefix="$RUNNER_TEMP/gsw"
+          "$RUNNER_TEMP/gsw/bin/gsw" --version
+          ./uninstall.sh --prefix="$RUNNER_TEMP/gsw"
